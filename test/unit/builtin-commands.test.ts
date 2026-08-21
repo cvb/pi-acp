@@ -32,6 +32,24 @@ test('PiAcpAgent: /steering is handled adapter-side', async () => {
   assert.match((last as any).update.content.text, /Steering mode: one-at-a-time/)
 })
 
+test('PiAcpAgent: /reload completes adapter-side without waiting for agent events', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess() as any
+
+  const agent = new PiAcpAgent(asAgentConn(conn))
+  ;(agent as any).sessions = new FakeSessions({ sessionId: 's1', proc, fileCommands: [] }) as any
+
+  const res = await agent.prompt({
+    sessionId: 's1',
+    prompt: [{ type: 'text', text: '/reload' }]
+  } as any)
+
+  assert.equal(res.stopReason, 'end_turn')
+  assert.deepEqual(proc.prompts, [{ message: '/reload', attachments: [] }])
+  const last = conn.updates.at(-1)
+  assert.match((last as any).update.content.text, /^Reloaded extensions/)
+})
+
 test('PiAcpAgent: /name sets session display name adapter-side', async () => {
   const conn = new FakeAgentSideConnection()
   const proc = new FakePiRpcProcess() as any

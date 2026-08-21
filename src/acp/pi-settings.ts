@@ -58,6 +58,15 @@ export function getEnableSkillCommands(cwd: string): boolean {
 }
 
 /**
+ * Whether ACP should advertise slash commands registered by Pi extensions.
+ * Defaults to true; set false in pi settings to hide them from the client menu.
+ */
+export function getIncludeExtensionCommands(cwd: string): boolean {
+  const merged = getMergedSettings(cwd)
+  return typeof merged.includeExtensionCommands === 'boolean' ? merged.includeExtensionCommands : true
+}
+
+/**
  * Mirror pi's quietStartup setting: if true, pi suppresses the verbose startup prelude.
  * We use it to decide whether to synthesize + emit our own "startup info" message.
  */

@@ -42,7 +42,7 @@ import {
 } from './translate/bash.js'
 import { promptToPiMessage } from './translate/prompt.js'
 import { loadSlashCommands, parseCommandArgs, toAvailableCommands } from './slash-commands.js'
-import { getAgentDir, getEnableSkillCommands, getQuietStartup } from './pi-settings.js'
+import { getAgentDir, getEnableSkillCommands, getIncludeExtensionCommands, getQuietStartup } from './pi-settings.js'
 import { toAvailableCommandsFromPiGetCommands } from './pi-commands.js'
 import { maybeAuthRequiredError } from './auth-required.js'
 import { isAbsolute } from 'node:path'
@@ -67,6 +67,10 @@ function builtinAvailableCommands(): AvailableCommand[] {
       name: 'compact',
       description: 'Manually compact the session context',
       input: { hint: 'optional custom instructions' }
+    },
+    {
+      name: 'reload',
+      description: 'Reload extensions, skills, prompts, themes, and context files'
     },
     {
       name: 'autocompact',
@@ -278,6 +282,7 @@ export class PiAcpAgent implements ACPAgent {
 
     const fileCommands = loadSlashCommands(params.cwd)
     const enableSkillCommands = getEnableSkillCommands(params.cwd)
+    const includeExtensionCommands = getIncludeExtensionCommands(params.cwd)
 
     // Pi doesn't support mcpServers, but we accept and store.
     const session = await this.sessions.create({
@@ -399,10 +404,11 @@ export class PiAcpAgent implements ACPAgent {
       void (async () => {
         try {
           const pi = (await session.proc.getCommands()) as any
-          const { commands } = toAvailableCommandsFromPiGetCommands(pi, {
+          const { commands, extensionCommandNames } = toAvailableCommandsFromPiGetCommands(pi, {
             enableSkillCommands,
-            includeExtensionCommands: false
+            includeExtensionCommands
           })
+          session.setExtensionCommandNames(extensionCommandNames)
 
           await this.conn.sessionUpdate({
             sessionId: session.sessionId,
@@ -448,6 +454,44 @@ export class PiAcpAgent implements ACPAgent {
       const cmd = space === -1 ? trimmed.slice(1) : trimmed.slice(1, space)
       const argsString = space === -1 ? '' : trimmed.slice(space + 1)
       const args = parseCommandArgs(argsString)
+
+      if (cmd === 'reload') {
+        if (args.length) {
+          await this.conn.sessionUpdate({
+            sessionId: session.sessionId,
+            update: {
+              sessionUpdate: 'agent_message_chunk',
+              content: { type: 'text', text: 'Usage: /reload' }
+            }
+          })
+          return { stopReason: 'end_turn' }
+        }
+
+        try {
+          // Pi's RPC protocol has no dedicated reload request. Sending its built-in
+          // command directly avoids session.prompt(), which waits for agent_settled;
+          // slash commands do not create an agent turn or emit that event.
+          await session.proc.prompt('/reload')
+        } catch (e: any) {
+          await this.conn.sessionUpdate({
+            sessionId: session.sessionId,
+            update: {
+              sessionUpdate: 'agent_message_chunk',
+              content: { type: 'text', text: `Reload failed: ${String(e?.message ?? e)}` }
+            }
+          })
+          return { stopReason: 'end_turn' }
+        }
+
+        await this.conn.sessionUpdate({
+          sessionId: session.sessionId,
+          update: {
+            sessionUpdate: 'agent_message_chunk',
+            content: { type: 'text', text: 'Reloaded extensions, skills, prompts, themes, and context files.' }
+          }
+        })
+        return { stopReason: 'end_turn' }
+      }
 
       if (cmd === 'compact') {
         const customInstructions = args.join(' ').trim() || undefined
@@ -945,6 +989,7 @@ export class PiAcpAgent implements ACPAgent {
     }
 
     const enableSkillCommands = getEnableSkillCommands(params.cwd)
+    const includeExtensionCommands = getIncludeExtensionCommands(params.cwd)
     const session = await this.restoreSession(params.sessionId, {
       cwd: params.cwd,
       mcpServers: params.mcpServers
@@ -1078,10 +1123,11 @@ export class PiAcpAgent implements ACPAgent {
       void (async () => {
         try {
           const pi = (await proc.getCommands()) as any
-          const { commands } = toAvailableCommandsFromPiGetCommands(pi, {
+          const { commands, extensionCommandNames } = toAvailableCommandsFromPiGetCommands(pi, {
             enableSkillCommands,
-            includeExtensionCommands: false
+            includeExtensionCommands
           })
+          session.setExtensionCommandNames(extensionCommandNames)
 
           await this.conn.sessionUpdate({
             sessionId: session.sessionId,

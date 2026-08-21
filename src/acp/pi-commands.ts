@@ -6,11 +6,28 @@ export type PiRpcCommandInfo = {
   source?: unknown
   location?: unknown
   path?: unknown
+  sourceInfo?: unknown
+}
+
+function commandSource(c: PiRpcCommandInfo): string {
+  if (typeof c.source === 'string') return c.source
+  const sourceInfo = c.sourceInfo
+  return sourceInfo && typeof sourceInfo === 'object' && typeof (sourceInfo as { source?: unknown }).source === 'string'
+    ? (sourceInfo as { source: string }).source
+    : ''
+}
+
+function commandLocation(c: PiRpcCommandInfo): string {
+  if (typeof c.location === 'string') return c.location
+  const sourceInfo = c.sourceInfo
+  return sourceInfo && typeof sourceInfo === 'object' && typeof (sourceInfo as { scope?: unknown }).scope === 'string'
+    ? (sourceInfo as { scope: string }).scope
+    : ''
 }
 
 function describeFallback(c: PiRpcCommandInfo): string {
-  const source = typeof c.source === 'string' ? c.source : ''
-  const location = typeof c.location === 'string' ? c.location : ''
+  const source = commandSource(c)
+  const location = commandLocation(c)
 
   const parts: string[] = []
   if (source) parts.push(source)
@@ -25,9 +42,10 @@ export function toAvailableCommandsFromPiGetCommands(
 ): {
   commands: AvailableCommand[]
   raw: PiRpcCommandInfo[]
+  extensionCommandNames: string[]
 } {
   const enableSkillCommands = opts?.enableSkillCommands ?? true
-  const includeExtensionCommands = opts?.includeExtensionCommands ?? false
+  const includeExtensionCommands = opts?.includeExtensionCommands ?? true
 
   const root: any = data
   const commandsRaw: PiRpcCommandInfo[] = Array.isArray(root?.commands)
@@ -37,12 +55,14 @@ export function toAvailableCommandsFromPiGetCommands(
       : []
 
   const out: AvailableCommand[] = []
+  const extensionCommandNames: string[] = []
 
   for (const c of commandsRaw) {
     const name = typeof c?.name === 'string' ? c.name.trim() : ''
     if (!name) continue
 
-    const source = typeof c?.source === 'string' ? c.source : ''
+    const source = commandSource(c)
+    if (source === 'extension') extensionCommandNames.push(name)
     if (!includeExtensionCommands && source === 'extension') continue
 
     if (!enableSkillCommands && name.startsWith('skill:')) continue
@@ -55,5 +75,5 @@ export function toAvailableCommandsFromPiGetCommands(
     })
   }
 
-  return { commands: out, raw: commandsRaw }
+  return { commands: out, raw: commandsRaw, extensionCommandNames }
 }
