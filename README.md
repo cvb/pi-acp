@@ -111,11 +111,13 @@ Point your ACP client to the built `dist/index.js`:
 
 ### Environment variables
 
-- `PI_ACP_ENABLE_EMBEDDED_CONTEXT=true` advertises ACP `promptCapabilities.embeddedContext` support to the client.
-- Default: unset/any other value means `false`.
-- When disabled, compliant ACP clients should avoid sending embedded `resource` blocks. If they send them anyway, `pi-acp` still degrades gracefully by converting them into plain-text prompt context.
+- `PI_ACP_ENABLE_EMBEDDED_CONTEXT=true` advertises ACP `promptCapabilities.embeddedContext` support to the client. It defaults to `false`. When disabled, compliant ACP clients should avoid sending embedded `resource` blocks. If they send them anyway, `pi-acp` still degrades gracefully by converting them into plain-text prompt context.
+- `PI_ACP_LOG=1` enables debug logging at `~/.pi/pi-acp/debug.log`.
+  - Set it to a file path to choose another destination, or to `stderr` to log to the adapter's standard error.
+  - The log includes ACP messages in both directions, pi RPC messages in both directions, pi's stderr, subprocess lifecycle events, and fatal adapter errors.
+  - Logging is disabled by default. Debug logs contain complete prompts, responses, and tool data, so treat them as sensitive and disable logging after troubleshooting.
 
-You can add the environment variable in the Zed settings with:
+You can add environment variables in the Zed settings with:
 
 ```json
   "agent_servers": {
@@ -125,6 +127,7 @@ You can add the environment variable in the Zed settings with:
       "args": ["/path/to/pi-acp/dist/index.js"],
       "env": {
           "PI_ACP_ENABLE_EMBEDDED_CONTEXT": "true",
+          "PI_ACP_LOG": "1"
       }
     }
   }

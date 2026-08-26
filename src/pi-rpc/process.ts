@@ -1,6 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import * as readline from 'node:readline'
 import { getPiCommand, shouldUseShellForPiCommand } from './command.js'
+import { debugLogger } from '../logging.js'
 
 export class PiRpcSpawnError extends Error {
   /** Underlying spawn error code, e.g. ENOENT, EACCES */
@@ -81,12 +82,15 @@ export class PiRpcProcess {
   private readonly pending = new Map<string, { resolve: (v: PiRpcResponse) => void; reject: (e: unknown) => void }>()
   private eventHandlers: Array<(ev: PiRpcEvent) => void> = []
   private readonly preludeLines: string[] = []
+  private readonly logPrefix: string
 
   private constructor(child: ChildProcessWithoutNullStreams) {
     this.child = child
+    this.logPrefix = `pi:${child.pid ?? 'unknown'}`
 
     const rl = readline.createInterface({ input: child.stdout })
     rl.on('line', line => {
+      debugLogger.log(`${this.logPrefix}:pi->adapter`, line)
       if (!line.trim()) return
       let msg: any
       try {
@@ -115,12 +119,14 @@ export class PiRpcProcess {
     })
 
     child.on('exit', (code, signal) => {
+      debugLogger.log(this.logPrefix, `process exited (code=${code}, signal=${signal})`)
       const err = new Error(`pi process exited (code=${code}, signal=${signal})`)
       for (const [, p] of this.pending) p.reject(err)
       this.pending.clear()
     })
 
     child.on('error', err => {
+      debugLogger.log(this.logPrefix, `process error: ${err.stack ?? String(err)}`)
       for (const [, p] of this.pending) p.reject(err)
       this.pending.clear()
     })
@@ -137,6 +143,10 @@ export class PiRpcProcess {
     const args = ['--mode', 'rpc', '--no-themes']
     if (params.sessionPath) args.push('--session', params.sessionPath)
 
+    debugLogger.log(
+      'pi:spawn',
+      `command=${JSON.stringify(cmd)} args=${JSON.stringify(args)} cwd=${JSON.stringify(params.cwd)}`
+    )
     const child = spawn(cmd, args, {
       cwd: params.cwd,
       stdio: 'pipe',
@@ -166,6 +176,7 @@ export class PiRpcProcess {
       })
     } catch (e: any) {
       const code = typeof e?.code === 'string' ? e.code : undefined
+      debugLogger.log('pi:spawn', `failed (code=${String(code)}, error=${e?.stack ?? String(e)})`)
       if (code === 'ENOENT') {
         throw new PiRpcSpawnError(
           `Could not start pi: executable not found (command: ${cmd}). Pi needs to be installed before it can run in ACP clients. Install it via \`npm install -g @earendil-works/pi-coding-agent\` or ensure \`pi\` is on your PATH. Then try again.`,
@@ -180,11 +191,14 @@ export class PiRpcProcess {
       throw new PiRpcSpawnError(`Could not start pi (command: ${cmd}).`, { code, cause: e })
     }
 
-    child.stderr.on('data', () => {
-      // leave stderr untouched; ACP clients may capture it.
-    })
-
     const proc = new PiRpcProcess(child)
+    debugLogger.log(proc.logPrefix, 'process spawned')
+    child.stderr.on('data', (chunk: Buffer) => {
+      debugLogger.chunk(`${proc.logPrefix}:stderr`, chunk)
+    })
+    child.stderr.on('end', () => {
+      debugLogger.flush(`${proc.logPrefix}:stderr`)
+    })
 
     // Best-effort handshake.
     // Important: pi may emit a get_state response pointing at a sessionFile in a directory
@@ -214,6 +228,7 @@ export class PiRpcProcess {
 
   dispose(signal: NodeJS.Signals | number = 'SIGTERM'): void {
     if (this.child.killed) return
+    debugLogger.log(this.logPrefix, `sending signal ${String(signal)}`)
     try {
       this.child.kill(signal as any)
     } catch {
@@ -340,10 +355,12 @@ export class PiRpcProcess {
   }
 
   private writeLine(line: string): Promise<void> {
+    debugLogger.log(`${this.logPrefix}:adapter->pi`, line)
     return new Promise<void>((resolve, reject) => {
       try {
         this.child.stdin.write(line, error => {
           if (error) {
+            debugLogger.log(this.logPrefix, `stdin write failed: ${error.stack ?? String(error)}`)
             reject(error)
             return
           }
@@ -351,6 +368,10 @@ export class PiRpcProcess {
           resolve()
         })
       } catch (error: unknown) {
+        debugLogger.log(
+          this.logPrefix,
+          `stdin write threw: ${error instanceof Error ? (error.stack ?? String(error)) : String(error)}`
+        )
         reject(error)
       }
     })
