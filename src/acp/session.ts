@@ -84,6 +84,24 @@ function getToolPath(args: unknown): string | undefined {
   return undefined
 }
 
+function toolCallTitle(toolName: string, args: unknown): string {
+  const path = getToolPath(args)
+  if (!path) return toolName
+
+  const record = args as { offset?: unknown; limit?: unknown }
+  const offset =
+    typeof record.offset === 'number' && Number.isInteger(record.offset) && record.offset > 0
+      ? record.offset
+      : undefined
+  const limit =
+    typeof record.limit === 'number' && Number.isInteger(record.limit) && record.limit > 0 ? record.limit : undefined
+  const firstLine = offset ?? (limit ? 1 : undefined)
+  const target = firstLine ? `${path}:${firstLine}${limit ? `-${firstLine + limit - 1}` : ''}` : path
+  const action = toolName === 'read' ? 'Read' : toolName === 'write' || toolName === 'edit' ? 'Edit' : toolName
+
+  return `${action} ${target}`
+}
+
 // Match pi's current edit schema: { path, edits: [{ oldText, newText }] }, with
 // legacy top-level oldText/newText still accepted. Pi also normalizes stringified edits.
 // https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/src/core/tools/edit.ts
@@ -631,7 +649,7 @@ export class PiAcpSession {
               this.emit({
                 sessionUpdate: 'tool_call',
                 toolCallId,
-                title: toolName,
+                title: toolCallTitle(toolName, rawInput),
                 kind: toToolKind(toolName),
                 status,
                 locations,
@@ -643,6 +661,7 @@ export class PiAcpSession {
               this.emit({
                 sessionUpdate: 'tool_call_update',
                 toolCallId,
+                title: toolCallTitle(toolName, rawInput),
                 status,
                 locations,
                 rawInput
@@ -712,7 +731,7 @@ export class PiAcpSession {
           this.emit({
             sessionUpdate: 'tool_call',
             toolCallId,
-            title: toolName,
+            title: toolCallTitle(toolName, args),
             kind: toToolKind(toolName),
             status: 'in_progress',
             locations,
@@ -723,6 +742,7 @@ export class PiAcpSession {
           this.emit({
             sessionUpdate: 'tool_call_update',
             toolCallId,
+            title: toolCallTitle(toolName, args),
             status: 'in_progress',
             locations,
             rawInput: args

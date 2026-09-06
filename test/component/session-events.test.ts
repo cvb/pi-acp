@@ -143,7 +143,33 @@ test('PiAcpSession: emits tool locations from pi path args', async () => {
 
   assert.equal(conn.updates.length, 1)
   assert.equal(conn.updates[0]!.update.sessionUpdate, 'tool_call')
+  assert.equal((conn.updates[0]!.update as any).title, 'Read src/acp/session.ts')
   assert.deepEqual((conn.updates[0]!.update as any).locations, [{ path: `${process.cwd()}/src/acp/session.ts` }])
+})
+
+test('PiAcpSession: includes read line range in the tool title', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+
+  new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  proc.emit({
+    type: 'tool_execution_start',
+    toolCallId: 't1',
+    toolName: 'read',
+    args: { path: 'README.md', offset: 3, limit: 2 }
+  })
+
+  await new Promise(r => setTimeout(r, 0))
+
+  assert.equal((conn.updates[0]!.update as any).title, 'Read README.md:3-4')
 })
 
 test('PiAcpSession: handles extension select via ACP permission request', async () => {
@@ -505,7 +531,42 @@ test('PiAcpSession: emits streamed tool locations from pi path args', async () =
 
   assert.equal(conn.updates.length, 1)
   assert.equal(conn.updates[0]!.update.sessionUpdate, 'tool_call')
+  assert.equal((conn.updates[0]!.update as any).title, 'Edit /tmp/test.txt')
   assert.deepEqual((conn.updates[0]!.update as any).locations, [{ path: '/tmp/test.txt' }])
+})
+
+test('PiAcpSession: updates a streamed tool title when its path becomes available', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+
+  new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  proc.emit({
+    type: 'message_update',
+    assistantMessageEvent: {
+      type: 'toolcall_start',
+      toolCall: { id: 't1', name: 'write' }
+    }
+  })
+  proc.emit({
+    type: 'tool_execution_start',
+    toolCallId: 't1',
+    toolName: 'write',
+    args: { path: 'new.txt', content: 'hello' }
+  })
+
+  await new Promise(r => setTimeout(r, 0))
+
+  assert.equal((conn.updates[0]!.update as any).title, 'write')
+  assert.equal((conn.updates[1]!.update as any).sessionUpdate, 'tool_call_update')
+  assert.equal((conn.updates[1]!.update as any).title, 'Edit new.txt')
 })
 
 test('PiAcpSession: emits edit tool line when oldText matches uniquely', async () => {
