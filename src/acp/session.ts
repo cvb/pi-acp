@@ -11,7 +11,13 @@ import type {
 import { RequestError } from '@agentclientprotocol/sdk'
 import { readFileSync } from 'node:fs'
 import { isAbsolute, resolve as resolvePath } from 'node:path'
-import { PiRpcProcess, PiRpcSpawnError, type PiRpcEvent } from '../pi-rpc/process.js'
+import {
+  PiRpcProcess,
+  PiRpcSpawnError,
+  SESSION_STATS_TIMEOUT_MS,
+  type PiRpcEvent,
+  type PiSessionStats
+} from '../pi-rpc/process.js'
 import { maybeAuthRequiredError } from './auth-required.js'
 import { SessionStore } from './session-store.js'
 import { expandSlashCommand, type FileSlashCommand } from './slash-commands.js'
@@ -39,7 +45,7 @@ type SessionCreateParams = {
 export type StopReason = 'end_turn' | 'cancelled' | 'error'
 
 type PendingTurn = {
-  queued: QueuedTurn
+  settling: boolean
   resolve: (reason: StopReason) => void
   reject: (err: unknown) => void
 }
@@ -48,6 +54,7 @@ type QueuedTurn = {
   message: string
   images: unknown[]
   completesWithoutAgentTurn: boolean
+  title?: string
   resolve: (reason: StopReason) => void
   reject: (err: unknown) => void
 }
@@ -60,6 +67,21 @@ const CONFIRM_PERMISSION_OPTIONS: PermissionOption[] = [
 ]
 const EXTENSION_UI_RAW_INPUT_KEYS = ['title', 'message', 'options', 'placeholder', 'prefill'] as const
 const CHOICE_OPTION_PREFIX = 'choice-'
+
+/**
+ * Map pi's `stats.contextUsage` to an ACP `usage_update`. Returns null whenever pi
+ * reports no trustworthy token count (e.g. `tokens: null` right after compaction) or
+ * the values are not usable integers.
+ */
+function toUsageUpdate(stats: PiSessionStats | null | undefined): SessionUpdate | null {
+  const used = stats?.contextUsage?.tokens
+  const size = stats?.contextUsage?.contextWindow
+
+  if (typeof used !== 'number' || !Number.isSafeInteger(used) || used < 0) return null
+  if (typeof size !== 'number' || !Number.isSafeInteger(size) || size <= 0) return null
+
+  return { sessionUpdate: 'usage_update', used, size }
+}
 
 function findUniqueLineNumber(text: string, needle: string): number | undefined {
   if (!needle) return undefined
@@ -240,7 +262,8 @@ export class SessionManager {
       mcpServers: params.mcpServers,
       proc,
       conn: params.conn,
-      fileCommands: params.fileCommands ?? []
+      fileCommands: params.fileCommands ?? [],
+      autoTitle: true
     })
 
     this.sessions.set(sessionId, session)
@@ -267,7 +290,8 @@ export class SessionManager {
       mcpServers: params.mcpServers,
       proc: params.proc,
       conn: params.conn,
-      fileCommands: params.fileCommands ?? []
+      fileCommands: params.fileCommands ?? [],
+      autoTitle: false
     })
 
     this.sessions.set(sessionId, session)
@@ -282,6 +306,9 @@ export class PiAcpSession {
 
   private startupInfo: string | null = null
   private startupInfoSent = false
+  private initialTitlePending: boolean
+  private lastPublishedTitle: string | null | undefined
+  private titleUpdateQueue: Promise<void> = Promise.resolve()
 
   readonly proc: PiRpcProcess
   private readonly conn: AgentSideConnection
@@ -324,6 +351,7 @@ export class PiAcpSession {
     proc: PiRpcProcess
     conn: AgentSideConnection
     fileCommands?: FileSlashCommand[]
+    autoTitle?: boolean
   }) {
     this.sessionId = opts.sessionId
     this.cwd = opts.cwd
@@ -331,6 +359,7 @@ export class PiAcpSession {
     this.proc = opts.proc
     this.conn = opts.conn
     this.fileCommands = opts.fileCommands ?? []
+    this.initialTitlePending = opts.autoTitle ?? false
 
     this.proc.onEvent(ev => this.handlePiEvent(ev))
   }
@@ -367,14 +396,14 @@ export class PiAcpSession {
     return this.extensionCommandNames.has(space === -1 ? text.slice(1) : text.slice(1, space))
   }
 
-  async prompt(message: string, images: unknown[] = []): Promise<StopReason> {
+  async prompt(message: string, images: unknown[] = [], title?: string): Promise<StopReason> {
     const completesWithoutAgentTurn = images.length === 0 && this.isExtensionCommand(message)
     // Pi executes extension commands before expanding prompt templates. Preserve that
     // ordering for commands advertised to the ACP client.
     const expandedMessage = completesWithoutAgentTurn ? message.trim() : expandSlashCommand(message, this.fileCommands)
 
     const turnPromise = new Promise<StopReason>((resolve, reject) => {
-      const queued: QueuedTurn = { message: expandedMessage, images, completesWithoutAgentTurn, resolve, reject }
+      const queued: QueuedTurn = { message: expandedMessage, images, completesWithoutAgentTurn, title, resolve, reject }
 
       // If a turn is already running, enqueue.
       if (this.pendingTurn) {
@@ -433,6 +462,52 @@ export class PiAcpSession {
     return this.cancelRequested
   }
 
+  async setSessionName(name: string): Promise<void> {
+    return this.enqueueTitleUpdate(async () => {
+      await this.proc.setSessionName(name)
+      this.publishTitle(name)
+    })
+  }
+
+  private enqueueTitleUpdate(update: () => Promise<void>): Promise<void> {
+    const result = this.titleUpdateQueue.then(update)
+    this.titleUpdateQueue = result.catch(() => {})
+    return result
+  }
+
+  publishTitle(title: string | null, updatedAt: string | null = new Date().toISOString()): Promise<void> {
+    if (this.lastPublishedTitle === title) return this.lastEmit
+    this.lastPublishedTitle = title
+    this.emit({
+      sessionUpdate: 'session_info_update',
+      title,
+      ...(updatedAt ? { updatedAt } : {})
+    })
+    return this.lastEmit
+  }
+
+  private async maybeAutoTitle(title?: string): Promise<void> {
+    if (!this.initialTitlePending || !title) return
+    this.initialTitlePending = false
+
+    try {
+      await this.enqueueTitleUpdate(async () => {
+        const state = (await this.proc.getState()) as { sessionName?: unknown } | null
+        const currentTitle = typeof state?.sessionName === 'string' ? state.sessionName.trim() : ''
+        if (currentTitle) {
+          this.publishTitle(currentTitle)
+          return
+        }
+        if (this.lastPublishedTitle) return
+
+        await this.proc.setSessionName(title)
+        this.publishTitle(title)
+      })
+    } catch {
+      // Auto-titling is best-effort and must not fail the completed prompt.
+    }
+  }
+
   private emit(update: SessionUpdate): void {
     // Serialize update delivery.
     this.lastEmit = this.lastEmit
@@ -450,6 +525,55 @@ export class PiAcpSession {
 
   private async flushEmits(): Promise<void> {
     await this.lastEmit
+  }
+
+  /**
+   * Best-effort: publish the real pi context-window occupancy as ACP `usage_update`.
+   * Queued updates are flushed even when the stats query fails or times out, so callers
+   * can await this before resolving `session/prompt`.
+   */
+  async publishContextUsage(): Promise<void> {
+    try {
+      // Older/stubbed pi processes may not expose the stats RPC at all.
+      if (typeof this.proc.getSessionStats === 'function') {
+        const update = toUsageUpdate(await this.proc.getSessionStats(SESSION_STATS_TIMEOUT_MS))
+        if (update) this.emit(update)
+      }
+    } catch {
+      // Context usage is auxiliary; never fail or delay the turn because of it.
+    }
+
+    await this.flushEmits()
+  }
+
+  private async settleTurn(reportContextUsage: boolean): Promise<void> {
+    const turn = this.pendingTurn
+    if (!turn || turn.settling) return
+    turn.settling = true
+
+    // Deliver queued updates before resolving the ACP prompt.
+    if (reportContextUsage) await this.publishContextUsage()
+    else await this.flushEmits()
+
+    const reason: StopReason = this.cancelRequested ? 'cancelled' : 'end_turn'
+    turn.resolve(reason)
+    this.pendingTurn = null
+    this.inAgentLoop = false
+
+    // Start next queued prompt, if any.
+    const next = this.turnQueue.shift()
+    if (next) {
+      this.emit({
+        sessionUpdate: 'agent_message_chunk',
+        content: { type: 'text', text: `Starting queued message. (${this.turnQueue.length} remaining)` }
+      })
+      this.startTurn(next)
+    } else {
+      this.emit({
+        sessionUpdate: 'session_info_update',
+        _meta: { piAcp: { queueDepth: 0, running: false } }
+      })
+    }
   }
 
   private emitBashToolCall(params: {
@@ -510,7 +634,9 @@ export class PiAcpSession {
     this.cancelRequested = false
     this.inAgentLoop = false
 
-    this.pendingTurn = { queued: t, resolve: t.resolve, reject: t.reject }
+    const turn: PendingTurn = { settling: false, resolve: t.resolve, reject: t.reject }
+    this.pendingTurn = turn
+    void this.maybeAutoTitle(t.title)
 
     // Publish queue depth (0 because we're starting the turn now).
     this.emit({
@@ -525,20 +651,20 @@ export class PiAcpSession {
       .prompt(t.message, t.images)
       .then(() => {
         // Side-effect-only extension commands do not emit agent_settled.
-        if (t.completesWithoutAgentTurn && this.pendingTurn?.queued === t && !this.inAgentLoop)
-          this.completePendingTurn()
+        if (t.completesWithoutAgentTurn && this.pendingTurn === turn && !this.inAgentLoop) void this.settleTurn(false)
       })
       .catch(err => {
         // If the subprocess errors before we get `agent_settled`, treat as error unless cancelled.
         // Also ensure we flush any already-enqueued updates first.
         void this.flushEmits().finally(() => {
+          if (this.pendingTurn !== turn || turn.settling) return
           // If this looks like an auth/config issue, surface AUTH_REQUIRED so clients can offer terminal login.
           const authErr = maybeAuthRequiredError(err)
           if (authErr) {
-            this.pendingTurn?.reject(authErr)
+            turn.reject(authErr)
           } else {
             const reason: StopReason = this.cancelRequested ? 'cancelled' : 'error'
-            this.pendingTurn?.resolve(reason)
+            turn.resolve(reason)
           }
 
           this.pendingTurn = null
@@ -555,33 +681,16 @@ export class PiAcpSession {
       })
   }
 
-  private completePendingTurn(): void {
-    void this.flushEmits().finally(() => {
-      const reason: StopReason = this.cancelRequested ? 'cancelled' : 'end_turn'
-      this.pendingTurn?.resolve(reason)
-      this.pendingTurn = null
-      this.inAgentLoop = false
-
-      const next = this.turnQueue.shift()
-      if (next) {
-        this.emit({
-          sessionUpdate: 'agent_message_chunk',
-          content: { type: 'text', text: `Starting queued message. (${this.turnQueue.length} remaining)` }
-        })
-        this.startTurn(next)
-      } else {
-        this.emit({
-          sessionUpdate: 'session_info_update',
-          _meta: { piAcp: { queueDepth: 0, running: false } }
-        })
-      }
-    })
-  }
-
   private handlePiEvent(ev: PiRpcEvent) {
     const type = String((ev as any).type ?? '')
 
     switch (type) {
+      case 'session_info_changed': {
+        const name = (ev as { name?: unknown }).name
+        if (typeof name === 'string' || name === undefined) this.publishTitle(name ?? null)
+        break
+      }
+
       case 'message_update': {
         const ame = (ev as any).assistantMessageEvent
 
@@ -904,7 +1013,7 @@ export class PiAcpSession {
       }
 
       case 'agent_settled': {
-        this.completePendingTurn()
+        void this.settleTurn(true)
         break
       }
 
